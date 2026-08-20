@@ -242,6 +242,52 @@ class SelectelClientTest(unittest.TestCase):
         self.assertIsNone(self.client.remove_record(
             ZONE_ID, RRSET_ID, VALIDATION_NAME, VALIDATION, 60))
 
+    def test_auth_failure_reports_keystone_error(self):
+        """Keystone nests the error in an object, breaking join()."""
+        self.adapter.register_uri(
+            "POST", f"{FAKE_AUTH_ENDPOINT}/identity/v3/auth/tokens",
+            status_code=401,
+            text=json.dumps({"error": {
+                "code": 401,
+                "title": "Unauthorized",
+                "message": "The request you have made requires "
+                           "authentication.",
+            }}),
+        )
+        with self.assertRaises(errors.PluginError) as ctx:
+            self.client.get_zone_id_by_domain(DOMAIN)
+        message = str(ctx.exception)
+        self.assertIn("401", message)
+        self.assertIn("Unauthorized", message)
+        self.assertIn("requires authentication", message)
+        self.assertIn("account_id", message)
+
+    def test_error_response_with_flat_error_fields(self):
+        """The domains API uses flat string fields instead."""
+        self.adapter.register_uri(
+            "GET", f"{FAKE_API_ENDPOINT}/domains/v2/zones",
+            additional_matcher=self._authenticated,
+            status_code=403,
+            text=json.dumps({"error": "forbidden",
+                             "description": "no access to the zone"}),
+        )
+        with self.assertRaises(errors.PluginError) as ctx:
+            self.client.get_zone_id_by_domain(DOMAIN)
+        message = str(ctx.exception)
+        self.assertIn("forbidden", message)
+        self.assertIn("no access to the zone", message)
+
+    def test_error_response_without_known_fields(self):
+        self.adapter.register_uri(
+            "GET", f"{FAKE_API_ENDPOINT}/domains/v2/zones",
+            additional_matcher=self._authenticated,
+            status_code=500,
+            text=json.dumps({"unexpected": "shape"}),
+        )
+        with self.assertRaises(errors.PluginError) as ctx:
+            self.client.get_zone_id_by_domain(DOMAIN)
+        self.assertIn("500", str(ctx.exception))
+
     def test_error_response_with_non_json_body(self):
         self.adapter.register_uri(
             "GET", f"{FAKE_API_ENDPOINT}/domains/v2/zones",

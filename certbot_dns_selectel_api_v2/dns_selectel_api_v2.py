@@ -1,5 +1,6 @@
 """DNS Authenticator for Selectel"""
 
+import json
 import logging
 
 import requests
@@ -109,15 +110,40 @@ class _SelectelClient(object):
                              f"status code {resp.status_code}"]
             try:
                 answer = resp.json()
-                try:
-                    message_parts.append(answer["error"])
-                except LookupError:
-                    pass
             except JSONDecodeError:
                 message_parts.append(
                     resp.content.decode("utf-8", "replace"))
+            else:
+                message = self._error_message(answer)
+                if message:
+                    message_parts.append(message)
             raise errors.PluginError(", ".join(message_parts))
         return resp
+
+    @staticmethod
+    def _error_message(answer):
+        """Render an API error body as text.
+
+        Keystone answers with a nested object, while the domains API uses
+        flat string fields, so neither may be joined into a message as is.
+        """
+        if not isinstance(answer, dict):
+            return str(answer)
+
+        error = answer.get("error")
+        if isinstance(error, dict):
+            # {"error": {"code": .., "title": .., "message": ..}}
+            parts = [str(error[key])
+                     for key in ("title", "message") if error.get(key)]
+            return ": ".join(parts) if parts else json.dumps(error)
+
+        parts = []
+        for key in ("error", "description"):
+            value = answer.get(key)
+            if value:
+                parts.append(value if isinstance(value, str)
+                             else json.dumps(value))
+        return ", ".join(parts)
 
     def _api(self, method, uri, data=None, params=None):
         resp = self._r(method, uri,
@@ -156,10 +182,18 @@ class _SelectelClient(object):
                     "project": {
                         "name": self.project_name,
                         "domain": {"name": self.account_id}}}}}
-        resp = self._r(
-            "POST", "/identity/v3/auth/tokens",
-            endpoint=self.auth_endpoint,
-            json=data)
+        try:
+            resp = self._r(
+                "POST", "/identity/v3/auth/tokens",
+                endpoint=self.auth_endpoint,
+                json=data)
+        except errors.PluginError as e:
+            raise errors.PluginError(
+                f"Selectel authentication failed: {e}. Check that "
+                f"account_id is the numeric account number (not an email), "
+                f"that username/password belong to a service user with "
+                f"access to the account, and that project_name is the "
+                f"textual project name.") from e
         token = resp.headers.get("X-Subject-Token")
         if not token:
             raise errors.PluginError("No subject token in "
