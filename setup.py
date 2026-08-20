@@ -2,11 +2,12 @@ from setuptools import setup
 from setuptools import find_packages
 from pathlib import Path
 
-version = "0.3.0"
+version = "0.4.0"
 
 install_requires = [
     "setuptools",
     "requests >= 2.22",
+    "certbot >= 2.0",
 ]
 
 this_directory = Path(__file__).parent
@@ -36,6 +37,7 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "Topic :: Internet :: WWW/HTTP",
         "Topic :: Security",
         "Topic :: System :: Installation/Setup",

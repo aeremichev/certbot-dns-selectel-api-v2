@@ -3,10 +3,8 @@
 import logging
 
 import requests
-import zope.interface
 
 from certbot import errors
-from certbot import interfaces
 from certbot.plugins import dns_common
 
 from .exceptions import JSONDecodeError
@@ -17,8 +15,6 @@ DEFAULT_AUTH_ENDPOINT = "https://cloud.api.selcloud.ru"
 DEFAULT_API_ENDPOINT = "https://api.selectel.ru"
 
 
-@zope.interface.implementer(interfaces.IAuthenticator)
-@zope.interface.provider(interfaces.IPluginFactory)
 class Authenticator(dns_common.DNSAuthenticator):
     """DNS Authenticator for Selectel
 
@@ -67,17 +63,15 @@ class Authenticator(dns_common.DNSAuthenticator):
         else:
             rrset_id = self._client.add_record(
                 zone_id, validation_name, validation, self.ttl)
-        self.__records[validation] = rrset_id
+        self.__records[validation] = (zone_id, rrset_id)
 
     def _cleanup(self, domain, validation_name, validation):
-        rrset_id = self.__records.get(validation, None)
-        if not rrset_id:
+        record = self.__records.pop(validation, None)
+        if not record:
             return
-        zone_id = self._client.get_zone_id_by_domain(domain)
-        self._client.del_record(zone_id, rrset_id)
-        self.__records = {k: v
-                          for k, v in self.__records.items()
-                          if v != rrset_id}
+        zone_id, rrset_id = record
+        self._client.remove_record(
+            zone_id, rrset_id, validation_name, validation, self.ttl)
 
     @property
     def _client(self):
@@ -105,10 +99,12 @@ class _SelectelClient(object):
 
         self.__token = None
 
-    def _r(self, method, uri, endpoint=None, *args, **kwargs):
+    def _r(self, method, uri, endpoint=None, allowed_statuses=(),
+           *args, **kwargs):
         url = f"{endpoint or self.api_endpoint}{uri}"
         resp = self.session.request(method, url, *args, **kwargs)
-        if resp.status_code >= 300:
+        if (resp.status_code >= 300
+                and resp.status_code not in allowed_statuses):
             message_parts = [f"API request error: "
                              f"status code {resp.status_code}"]
             try:
@@ -118,7 +114,8 @@ class _SelectelClient(object):
                 except LookupError:
                     pass
             except JSONDecodeError:
-                message_parts.append(resp.content)
+                message_parts.append(
+                    resp.content.decode("utf-8", "replace"))
             raise errors.PluginError(", ".join(message_parts))
         return resp
 
@@ -160,13 +157,13 @@ class _SelectelClient(object):
                         "name": self.project_name,
                         "domain": {"name": self.account_id}}}}}
         resp = self._r(
-            "POST", f"/identity/v3/auth/tokens",
+            "POST", "/identity/v3/auth/tokens",
             endpoint=self.auth_endpoint,
             json=data)
         token = resp.headers.get("X-Subject-Token")
         if not token:
-            raise errors.PluginError(f"No subject token "
-                                     f"in authorization response.")
+            raise errors.PluginError("No subject token in "
+                                     "authorization response.")
         return token
 
     @property
@@ -177,10 +174,17 @@ class _SelectelClient(object):
 
     def get_zone_id_by_domain(self, domain):
         domain_with_dot = domain + "."
-        for zone in self._api_iter_result("GET", f"/domains/v2/zones"):
-            if domain_with_dot.endswith(zone["name"]):
-                return zone["id"]
-        raise errors.PluginError(f"Zone not found for domain {domain}")
+        best_zone = None
+        for zone in self._api_iter_result("GET", "/domains/v2/zones"):
+            name = zone["name"]
+            if (domain_with_dot != name
+                    and not domain_with_dot.endswith("." + name)):
+                continue
+            if best_zone is None or len(name) > len(best_zone["name"]):
+                best_zone = zone
+        if best_zone is None:
+            raise errors.PluginError(f"Zone not found for domain {domain}")
+        return best_zone["id"]
 
     def get_zone_rrset_by_name(self, zone_id, name):
         expected_name = name + "."
@@ -216,3 +220,35 @@ class _SelectelClient(object):
         resp = self._api(
             "DELETE", f"/domains/v2/zones/{zone_id}/rrset/{rrset_id}")
         return resp
+
+    def get_rrset(self, zone_id, rrset_id):
+        """Return the rrset or None if it is already gone."""
+        resp = self._r("GET",
+                       f"/domains/v2/zones/{zone_id}/rrset/{rrset_id}",
+                       headers={"X-Auth-Token": self._token},
+                       allowed_statuses=(404,))
+        if resp.status_code == 404:
+            return None
+        try:
+            return resp.json()
+        except JSONDecodeError:
+            return None
+
+    def remove_record(self, zone_id, rrset_id,
+                      validation_name, validation, ttl):
+        """Drop our own value from the rrset, keeping any foreign records."""
+        rrset = self.get_rrset(zone_id, rrset_id)
+        if rrset is None:
+            return None
+        content = f'"{validation}"'
+        records = [record for record in rrset.get("records", [])
+                   if record.get("content") != content]
+        if not records:
+            return self.del_record(zone_id, rrset_id)
+        return self._api(
+            "PATCH", f"/domains/v2/zones/{zone_id}/rrset/{rrset_id}", data={
+                "name": validation_name,
+                "ttl": ttl,
+                "type": "TXT",
+                "records": records,
+            })
